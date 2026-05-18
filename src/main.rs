@@ -2,6 +2,9 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use url::Url;
 
+mod config;
+use config::Config;
+
 fn main() {
     let (input_url, copy_flag, help_flag) = parse_args(std::env::args().skip(1));
 
@@ -10,6 +13,7 @@ fn main() {
         return;
     }
 
+    let config = Config::load();
     let had_input = input_url.is_some();
 
     let input = match input_url {
@@ -27,7 +31,7 @@ fn main() {
 
     let should_copy = if had_input { copy_flag } else { true };
 
-    let cleaned = clean_url(&input);
+    let cleaned = clean_url(&input, &config);
 
     println!("{cleaned}");
 
@@ -114,7 +118,7 @@ fn write_clipboard(text: &str) {
     }
 }
 
-fn clean_url(input: &str) -> String {
+fn clean_url(input: &str, config: &Config) -> String {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return String::new();
@@ -136,54 +140,46 @@ fn clean_url(input: &str) -> String {
     }
 
     let host = url.host_str().unwrap_or("").to_lowercase();
+    let platform = config::find_platform(&host, config);
 
-    if is_youtube(&host) {
-        return clean_youtube(&url);
+    // YouTube uses a built-in URL reconstructor
+    if let Some((_, pconfig)) = &platform
+        && pconfig.cleaner.as_deref() == Some("youtube")
+    {
+        return clean_youtube(&url, config, pconfig);
     }
 
-    if is_x_or_twitter(&host) {
-        remove_tracking_params(&mut url);
-        remove_fragment(&mut url);
-        normalize_host(&mut url);
-        return url.to_string();
+    // General tracking removal (applies to ALL URLs)
+    remove_tracking_params(
+        &mut url,
+        &config.general.tracking_params,
+        &config.general.tracking_prefixes,
+    );
+
+    // Platform-specific tracking removal
+    if let Some((_, pconfig)) = &platform {
+        remove_tracking_params(
+            &mut url,
+            &pconfig.tracking_params,
+            &pconfig.tracking_prefixes,
+        );
     }
 
-    remove_tracking_params(&mut url);
     remove_fragment(&mut url);
-    normalize_host(&mut url);
+    normalize_host(
+        &mut url,
+        platform.and_then(|(_, p)| p.normalize_host.as_deref()),
+    );
     url.to_string()
 }
 
-fn is_youtube(host: &str) -> bool {
-    matches!(
-        host,
-        "youtube.com"
-            | "www.youtube.com"
-            | "m.youtube.com"
-            | "youtu.be"
-            | "www.youtu.be"
-            | "music.youtube.com"
-            | "www.music.youtube.com"
-            | "youtube-nocookie.com"
-            | "www.youtube-nocookie.com"
-    )
-}
-
-fn is_x_or_twitter(host: &str) -> bool {
-    let h = host
-        .strip_prefix("www.")
-        .or_else(|| host.strip_prefix("m."))
-        .unwrap_or(host);
-    h == "x.com" || h == "twitter.com"
-}
-
-fn clean_youtube(url: &Url) -> String {
+fn clean_youtube(url: &Url, config: &Config, pconfig: &config::PlatformConfig) -> String {
     let host = url.host_str().unwrap_or("").to_lowercase();
 
+    // youtu.be/VIDEO_ID
     if host == "youtu.be" || host == "www.youtu.be" {
         let path = url.path().trim_start_matches('/');
         let id = path.split(&['/', '?', '#'][..]).next().unwrap_or(path);
-
         if is_valid_video_id(id) {
             if let Some(ts) = extract_timestamp(url) {
                 return format!("https://youtu.be/{id}?t={ts}");
@@ -192,6 +188,7 @@ fn clean_youtube(url: &Url) -> String {
         }
     }
 
+    // youtube.com/watch?v=ID
     if let Some(v) = url.query_pairs().find(|(k, _)| k == "v") {
         let id = v.1.to_string();
         if is_valid_video_id(&id) {
@@ -202,6 +199,7 @@ fn clean_youtube(url: &Url) -> String {
         }
     }
 
+    // youtube.com/shorts/ID
     let path = url.path();
     if let Some(stripped) = path.strip_prefix("/shorts/") {
         let id = stripped.split(&['/', '?', '#'][..]).next().unwrap_or(stripped);
@@ -212,6 +210,8 @@ fn clean_youtube(url: &Url) -> String {
             return format!("https://youtu.be/{id}");
         }
     }
+
+    // youtube.com/embed/ID
     if let Some(stripped) = path.strip_prefix("/embed/") {
         let id = stripped.split(&['/', '?', '#'][..]).next().unwrap_or(stripped);
         if is_valid_video_id(id) {
@@ -222,8 +222,18 @@ fn clean_youtube(url: &Url) -> String {
         }
     }
 
+    // Fallback: remove tracking params without URL reconstruction
     let mut u = url.clone();
-    remove_tracking_params(&mut u);
+    remove_tracking_params(
+        &mut u,
+        &config.general.tracking_params,
+        &config.general.tracking_prefixes,
+    );
+    remove_tracking_params(
+        &mut u,
+        &pconfig.tracking_params,
+        &pconfig.tracking_prefixes,
+    );
     remove_fragment(&mut u);
     u.to_string()
 }
@@ -244,20 +254,24 @@ fn is_valid_video_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 11 && id.chars().all(|c| c.is_alphanumeric() || c == '-' || c == '_')
 }
 
-const TRACKING_PARAMS: &[&str] = &[
-    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_id",
-    "fbclid", "gclid", "dclid", "msclkid",
-    "si", "igshid", "igsh", "mibextid", "__tn__",
-    "s",
-];
+fn remove_tracking_params(
+    url: &mut Url,
+    tracking_params: &[String],
+    tracking_prefixes: &[String],
+) {
+    if tracking_params.is_empty() && tracking_prefixes.is_empty() {
+        return;
+    }
 
-fn remove_tracking_params(url: &mut Url) {
     let pairs: Vec<(String, String)> = url
         .query_pairs()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect();
 
-    let to_keep: Vec<&(String, String)> = pairs.iter().filter(|(k, _)| !is_tracking_param(k)).collect();
+    let to_keep: Vec<&(String, String)> = pairs
+        .iter()
+        .filter(|(k, _)| !is_tracking_param(k, tracking_params, tracking_prefixes))
+        .collect();
 
     if to_keep.len() == pairs.len() {
         return;
@@ -274,23 +288,27 @@ fn remove_tracking_params(url: &mut Url) {
     }
 }
 
-fn is_tracking_param(key: &str) -> bool {
+fn is_tracking_param(key: &str, tracking_params: &[String], tracking_prefixes: &[String]) -> bool {
     let lower = key.to_lowercase();
-    lower.starts_with("utm_") || TRACKING_PARAMS.contains(&lower.as_str())
+    tracking_params.contains(&lower)
+        || tracking_prefixes.iter().any(|p| lower.starts_with(p))
 }
 
 fn remove_fragment(url: &mut Url) {
     url.set_fragment(None);
 }
 
-fn normalize_host(url: &mut Url) {
+fn normalize_host(url: &mut Url, normalize_target: Option<&str>) {
     if let Some(host) = url.host_str() {
         let lower = host.to_lowercase();
         let cleaned = lower
             .strip_prefix("www.")
             .or_else(|| lower.strip_prefix("m."))
             .unwrap_or(&lower);
-        let cleaned = if cleaned == "twitter.com" { "x.com" } else { cleaned };
+        let cleaned = match normalize_target {
+            Some(target) if cleaned != target => target,
+            _ => cleaned,
+        };
         if cleaned != lower {
             let _ = url.set_host(Some(cleaned));
         }
@@ -301,10 +319,14 @@ fn normalize_host(url: &mut Url) {
 mod tests {
     use super::*;
 
+    fn clean(input: &str) -> String {
+        clean_url(input, &Config::default())
+    }
+
     #[test]
     fn test_youtube_watch() {
         assert_eq!(
-            clean_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+            clean("https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
             "https://youtu.be/dQw4w9WgXcQ"
         );
     }
@@ -312,7 +334,7 @@ mod tests {
     #[test]
     fn test_youtube_short() {
         assert_eq!(
-            clean_url("https://youtu.be/dQw4w9WgXcQ"),
+            clean("https://youtu.be/dQw4w9WgXcQ"),
             "https://youtu.be/dQw4w9WgXcQ"
         );
     }
@@ -320,7 +342,7 @@ mod tests {
     #[test]
     fn test_youtube_shorts() {
         assert_eq!(
-            clean_url("https://www.youtube.com/shorts/dQw4w9WgXcQ"),
+            clean("https://www.youtube.com/shorts/dQw4w9WgXcQ"),
             "https://youtu.be/dQw4w9WgXcQ"
         );
     }
@@ -328,7 +350,7 @@ mod tests {
     #[test]
     fn test_youtube_embed() {
         assert_eq!(
-            clean_url("https://www.youtube.com/embed/dQw4w9WgXcQ"),
+            clean("https://www.youtube.com/embed/dQw4w9WgXcQ"),
             "https://youtu.be/dQw4w9WgXcQ"
         );
     }
@@ -336,7 +358,7 @@ mod tests {
     #[test]
     fn test_youtube_music() {
         assert_eq!(
-            clean_url("https://music.youtube.com/watch?v=dQw4w9WgXcQ"),
+            clean("https://music.youtube.com/watch?v=dQw4w9WgXcQ"),
             "https://youtu.be/dQw4w9WgXcQ"
         );
     }
@@ -344,7 +366,7 @@ mod tests {
     #[test]
     fn test_youtube_with_timestamp() {
         assert_eq!(
-            clean_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=123"),
+            clean("https://www.youtube.com/watch?v=dQw4w9WgXcQ&t=123"),
             "https://youtu.be/dQw4w9WgXcQ?t=123"
         );
     }
@@ -352,21 +374,21 @@ mod tests {
     #[test]
     fn test_youtube_with_start() {
         assert_eq!(
-            clean_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&start=60"),
+            clean("https://www.youtube.com/watch?v=dQw4w9WgXcQ&start=60"),
             "https://youtu.be/dQw4w9WgXcQ?t=60"
         );
     }
 
     #[test]
     fn test_youtube_strips_tracking() {
-        let result = clean_url("https://www.youtube.com/watch?v=dQw4w9WgXcQ&si=abc123&utm_source=twitter");
+        let result = clean("https://www.youtube.com/watch?v=dQw4w9WgXcQ&si=abc123&utm_source=twitter");
         assert_eq!(result, "https://youtu.be/dQw4w9WgXcQ");
     }
 
     #[test]
     fn test_youtube_short_with_timestamp() {
         assert_eq!(
-            clean_url("https://youtu.be/dQw4w9WgXcQ?t=123"),
+            clean("https://youtu.be/dQw4w9WgXcQ?t=123"),
             "https://youtu.be/dQw4w9WgXcQ?t=123"
         );
     }
@@ -374,7 +396,7 @@ mod tests {
     #[test]
     fn test_twitter_to_x() {
         assert_eq!(
-            clean_url("https://twitter.com/user/status/123456789"),
+            clean("https://twitter.com/user/status/123456789"),
             "https://x.com/user/status/123456789"
         );
     }
@@ -382,7 +404,7 @@ mod tests {
     #[test]
     fn test_x_strips_s_param() {
         assert_eq!(
-            clean_url("https://x.com/user/status/123456789?s=20"),
+            clean("https://x.com/user/status/123456789?s=20"),
             "https://x.com/user/status/123456789"
         );
     }
@@ -390,7 +412,7 @@ mod tests {
     #[test]
     fn test_instagram_strips_tracking() {
         assert_eq!(
-            clean_url("https://www.instagram.com/p/CxYzAbCdEfG/?igshid=abc123"),
+            clean("https://www.instagram.com/p/CxYzAbCdEfG/?igshid=abc123"),
             "https://instagram.com/p/CxYzAbCdEfG/"
         );
     }
@@ -398,7 +420,7 @@ mod tests {
     #[test]
     fn test_instagram_strips_m() {
         assert_eq!(
-            clean_url("https://m.instagram.com/p/CxYzAbCdEfG/"),
+            clean("https://m.instagram.com/p/CxYzAbCdEfG/"),
             "https://instagram.com/p/CxYzAbCdEfG/"
         );
     }
@@ -406,7 +428,7 @@ mod tests {
     #[test]
     fn test_facebook_strips_tracking() {
         assert_eq!(
-            clean_url("https://www.facebook.com/user/posts/12345?__tn__=abc&fbclid=def"),
+            clean("https://www.facebook.com/user/posts/12345?__tn__=abc&fbclid=def"),
             "https://facebook.com/user/posts/12345"
         );
     }
@@ -414,7 +436,7 @@ mod tests {
     #[test]
     fn test_facebook_strips_m() {
         assert_eq!(
-            clean_url("https://m.facebook.com/user/posts/12345"),
+            clean("https://m.facebook.com/user/posts/12345"),
             "https://facebook.com/user/posts/12345"
         );
     }
@@ -422,7 +444,7 @@ mod tests {
     #[test]
     fn test_utm_removal() {
         assert_eq!(
-            clean_url("https://example.com/page?utm_source=twitter&utm_medium=social&foo=bar"),
+            clean("https://example.com/page?utm_source=twitter&utm_medium=social&foo=bar"),
             "https://example.com/page?foo=bar"
         );
     }
@@ -430,7 +452,7 @@ mod tests {
     #[test]
     fn test_fbclid_removal() {
         assert_eq!(
-            clean_url("https://example.com/page?fbclid=abc123"),
+            clean("https://example.com/page?fbclid=abc123"),
             "https://example.com/page"
         );
     }
@@ -438,7 +460,7 @@ mod tests {
     #[test]
     fn test_gclid_removal() {
         assert_eq!(
-            clean_url("https://example.com/page?gclid=abc123"),
+            clean("https://example.com/page?gclid=abc123"),
             "https://example.com/page"
         );
     }
@@ -446,7 +468,7 @@ mod tests {
     #[test]
     fn test_fragment_removal() {
         assert_eq!(
-            clean_url("https://example.com/page#section"),
+            clean("https://example.com/page#section"),
             "https://example.com/page"
         );
     }
@@ -454,7 +476,7 @@ mod tests {
     #[test]
     fn test_http_upgrade() {
         assert_eq!(
-            clean_url("http://example.com/page"),
+            clean("http://example.com/page"),
             "https://example.com/page"
         );
     }
@@ -462,25 +484,34 @@ mod tests {
     #[test]
     fn test_www_stripped() {
         assert_eq!(
-            clean_url("https://www.example.com/page"),
+            clean("https://www.example.com/page"),
             "https://example.com/page"
         );
     }
 
     #[test]
+    fn test_generic_s_param_preserved() {
+        // ?s= on a non-X platform should NOT be removed
+        assert_eq!(
+            clean("https://example.com/page?s=foo"),
+            "https://example.com/page?s=foo"
+        );
+    }
+
+    #[test]
     fn test_invalid_url_preserved() {
-        assert_eq!(clean_url("not a url"), "not a url");
+        assert_eq!(clean("not a url"), "not a url");
     }
 
     #[test]
     fn test_empty_input() {
-        assert_eq!(clean_url(""), "");
+        assert_eq!(clean(""), "");
     }
 
     #[test]
     fn test_whitespace_trimmed() {
         assert_eq!(
-            clean_url("  https://www.youtube.com/watch?v=dQw4w9WgXcQ  "),
+            clean("  https://www.youtube.com/watch?v=dQw4w9WgXcQ  "),
             "https://youtu.be/dQw4w9WgXcQ"
         );
     }
@@ -488,7 +519,7 @@ mod tests {
     #[test]
     fn test_url_without_scheme() {
         assert_eq!(
-            clean_url("youtube.com/watch?v=dQw4w9WgXcQ"),
+            clean("youtube.com/watch?v=dQw4w9WgXcQ"),
             "https://youtu.be/dQw4w9WgXcQ"
         );
     }
@@ -496,15 +527,15 @@ mod tests {
     #[test]
     fn test_mibextid_removal() {
         assert_eq!(
-            clean_url("https://example.com/page?mibextid=xyz"),
-            "https://example.com/page"
+            clean("https://facebook.com/page?mibextid=xyz"),
+            "https://facebook.com/page"
         );
     }
 
     #[test]
     fn test_dclid_removal() {
         assert_eq!(
-            clean_url("https://example.com/page?dclid=xyz"),
+            clean("https://example.com/page?dclid=xyz"),
             "https://example.com/page"
         );
     }
@@ -512,7 +543,7 @@ mod tests {
     #[test]
     fn test_msclkid_removal() {
         assert_eq!(
-            clean_url("https://example.com/page?msclkid=xyz"),
+            clean("https://example.com/page?msclkid=xyz"),
             "https://example.com/page"
         );
     }
