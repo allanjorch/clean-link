@@ -99,4 +99,4 @@ MIT
 
 ---
 
-Built with [Allan Jørch](https://github.com/allanjorch) and [Claude Code](https://claude.ai) (opencode).
+Built with [Allan Jorch](https://github.com/allanjorch) and [Claude Code](https://claude.ai) (opencode).
