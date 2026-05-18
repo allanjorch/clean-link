@@ -34,15 +34,94 @@ pub struct PlatformConfig {
 
 impl Config {
     pub fn load() -> Self {
-        if let Some(path) = config_file_path()
-            && let Ok(content) = std::fs::read_to_string(&path)
-            && let Ok(config) = toml::from_str(&content)
-        {
-            return config;
+        if let Some(path) = config_file_path() {
+            if path.exists() {
+                if let Ok(content) = std::fs::read_to_string(&path)
+                    && let Ok(config) = toml::from_str(&content)
+                {
+                    return config;
+                }
+            } else {
+                init_config_file(&path);
+            }
         }
         Config::default()
     }
 }
+
+fn init_config_file(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, DEFAULT_CONFIG_TOML);
+}
+
+const DEFAULT_CONFIG_TOML: &str = "# clean-link configuration
+# Auto-generated with default values.
+# Edit this file to customize tracking parameters per platform.
+
+[general]
+# Tracking parameters removed from ALL URLs
+tracking_params = [
+    \"utm_source\",
+    \"utm_medium\",
+    \"utm_campaign\",
+    \"utm_term\",
+    \"utm_content\",
+    \"utm_id\",
+    \"fbclid\",
+    \"gclid\",
+    \"dclid\",
+    \"msclkid\",
+]
+# Query parameters starting with these prefixes are also removed globally
+tracking_prefixes = [\"utm_\"]
+
+[platforms.youtube]
+domains = [
+    \"youtube.com\",
+    \"www.youtube.com\",
+    \"m.youtube.com\",
+    \"youtu.be\",
+    \"www.youtu.be\",
+    \"music.youtube.com\",
+    \"www.music.youtube.com\",
+    \"youtube-nocookie.com\",
+    \"www.youtube-nocookie.com\",
+]
+# Removed only on YouTube URLs
+tracking_params = [\"si\"]
+
+[platforms.x]
+domains = [
+    \"x.com\",
+    \"www.x.com\",
+    \"m.x.com\",
+    \"twitter.com\",
+    \"www.twitter.com\",
+    \"m.twitter.com\",
+]
+tracking_params = [\"s\"]
+normalize_host = \"x.com\"
+
+[platforms.instagram]
+domains = [
+    \"instagram.com\",
+    \"www.instagram.com\",
+    \"m.instagram.com\",
+]
+tracking_params = [\"igshid\", \"igsh\"]
+
+[platforms.facebook]
+domains = [
+    \"facebook.com\",
+    \"www.facebook.com\",
+    \"m.facebook.com\",
+    \"fb.com\",
+    \"www.fb.com\",
+]
+tracking_params = [\"mibextid\", \"__tn__\"]
+";
 
 impl Default for Config {
     fn default() -> Self {
