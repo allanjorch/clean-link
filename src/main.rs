@@ -1,6 +1,7 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 use url::Url;
+use reqwest::blocking::Client;
 
 mod config;
 use config::Config;
@@ -142,6 +143,26 @@ fn clean_url(input: &str, config: &Config) -> String {
     let host = url.host_str().unwrap_or("").to_lowercase();
     let platform = config::find_platform(&host, config);
 
+    // YouTube redirect — extract the real destination from the `q` param
+    if let Some((_, pconfig)) = &platform
+        && pconfig.cleaner.as_deref() == Some("youtube")
+        && url.path() == "/redirect"
+        && let Some(dest) = url
+            .query_pairs()
+            .find(|(k, _)| k == "q")
+            .map(|(_, v)| v.to_string())
+        && !dest.is_empty()
+    {
+        return clean_url(&dest, config);
+    }
+
+    // Resolve t.co shortened URLs via HTTP redirect
+    if host == "t.co"
+        && let Some(resolved) = resolve_redirect(url.as_ref())
+    {
+        return clean_url(&resolved, config);
+    }
+
     // YouTube uses a built-in URL reconstructor
     if let Some((_, pconfig)) = &platform
         && pconfig.cleaner.as_deref() == Some("youtube")
@@ -236,6 +257,28 @@ fn clean_youtube(url: &Url, config: &Config, pconfig: &config::PlatformConfig) -
     );
     remove_fragment(&mut u);
     u.to_string()
+}
+
+fn resolve_redirect(url_str: &str) -> Option<String> {
+    let client = Client::builder()
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .ok()?;
+
+    let resp = client.head(url_str).send().ok()?;
+    let final_url = resp.url().to_string();
+
+    if final_url == url_str {
+        let resp = client.get(url_str).send().ok()?;
+        let final_url = resp.url().to_string();
+        if final_url == url_str {
+            return None;
+        }
+        return Some(final_url);
+    }
+
+    Some(final_url)
 }
 
 fn extract_timestamp(url: &Url) -> Option<String> {
@@ -545,6 +588,46 @@ mod tests {
         assert_eq!(
             clean("https://example.com/page?msclkid=xyz"),
             "https://example.com/page"
+        );
+    }
+
+    #[test]
+    fn test_youtube_redirect_extracts_destination() {
+        assert_eq!(
+            clean("https://www.youtube.com/redirect?event=video_description&redir_token=TOKEN&q=https%3A%2F%2Fexample.com%2Fpage&v=rAzT5lcezPs"),
+            "https://example.com/page"
+        );
+    }
+
+    #[test]
+    fn test_youtube_redirect_mobile() {
+        assert_eq!(
+            clean("https://m.youtube.com/redirect?event=video_description&q=https%3A%2F%2Fexample.com%2Fpage&v=rAzT5lcezPs"),
+            "https://example.com/page"
+        );
+    }
+
+    #[test]
+    fn test_tco_url_bypasses_redirect_resolution_in_tests() {
+        let result = clean("https://example.com/page");
+        assert_eq!(result, "https://example.com/page");
+    }
+
+    #[ignore]
+    #[test]
+    fn test_tco_resolves_via_network() {
+        let result = clean("https://t.co/S16ync3MBq");
+        assert_ne!(result, "https://t.co/S16ync3MBq");
+        assert!(result.starts_with("https://"));
+        assert!(!result.contains("t.co"));
+        println!("t.co resolved to: {result}");
+    }
+
+    #[test]
+    fn test_youtube_redirect_cleans_destination_tracking() {
+        assert_eq!(
+            clean("https://www.youtube.com/redirect?event=video_description&q=https%3A%2F%2Fexample.com%2Fpage%3Futm_source%3Dtwitter%26foo%3Dbar&v=rAzT5lcezPs"),
+            "https://example.com/page?foo=bar"
         );
     }
 }

@@ -91,6 +91,8 @@ domains = [
 ]
 # Removed only on YouTube URLs
 tracking_params = [\"si\"]
+# Built-in: YouTube /redirect URLs are automatically unwrapped
+# (the `q` parameter is extracted and cleaned recursively)
 
 [platforms.x]
 domains = [
@@ -103,6 +105,8 @@ domains = [
 ]
 tracking_params = [\"s\"]
 normalize_host = \"x.com\"
+# Built-in: t.co short URLs are automatically resolved via HTTP redirect
+# and the destination URL is then cleaned through the full pipeline
 
 [platforms.instagram]
 domains = [
